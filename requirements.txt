@@ -1,0 +1,10 @@
+numpy==1.16.0
+torch==1.0.0
+joblib==0.9.4
+pandas
+matplotlib
+tqdm
+diskcache
+tensorboardX
+bokeh
+sklearn
