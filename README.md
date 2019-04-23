@@ -1,9 +1,9 @@
 # Learning to route in similarity graphs
-A supplementary code for anonymous ICML2019 submission.
+Code for ICML2019 paper: [TODO: Link]()
 
 # What does it do?
 It learns a mapping for vertices in an HNSW graph so as to improve nearest neighbor search and avoid local optima.
-![img](https://github.com/ICMLIncognito/learning_to_route/raw/master/images/toy_task.png)
+![img](https://github.com/dbaranchuk/learning-to-route-for-ann/raw/master/images/toy_task.png)
 
 # What do i need to run it?
 * A machine with some CPU (preferably 8+) and a GPU
@@ -21,7 +21,7 @@ It learns a mapping for vertices in an HNSW graph so as to improve nearest neigh
  * You will also need jupyter or some other way to work with .ipynb files
 4. Run jupyter notebook and open a notebook in `./notebooks/`
  * Before you run the first cell, change `%env CUDA_VISIBLE_DEVICES=#` to an index that you plan to use.
- * First it downloads data from dropbox. You will need up to __50-100Gb__ of disk space because *anonymousauthor* is an idiot.
+ * First it downloads data from dropbox. You will need up to __50-100Gb__ (Patch without these files coming soon).
  * Second, defines an experiment setup. The setups are:
     * `deep100k_only_routing.ipynb` - DEEP100K dataset, 128dcs budget, 96d vectors, no compression
     * `glove100k_compression.ipynb` - GLOVE100K dataset, 256dcs budget, 300d vectors, compressed to 75d
