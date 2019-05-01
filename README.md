@@ -5,7 +5,7 @@ Code for ICML2019 paper: [TODO: Link]()
 It learns a mapping for vertices in an HNSW graph so as to improve nearest neighbor search and avoid local optima.
 ![img](https://github.com/dbaranchuk/learning-to-route-for-ann/raw/master/images/toy_task.png)
 
-# What do i need to run it?
+# What do I need to run it?
 * A machine with some CPU (preferably 8+) and a GPU
   * Running with no GPU or less than 4 CPU cores may cause premature senility;
 * Some popular Linux x64 distribution
@@ -21,10 +21,11 @@ It learns a mapping for vertices in an HNSW graph so as to improve nearest neigh
  * You will also need jupyter or some other way to work with .ipynb files
 4. Run jupyter notebook and open a notebook in `./notebooks/`
  * Before you run the first cell, change `%env CUDA_VISIBLE_DEVICES=#` to an index that you plan to use.
- * First it downloads data from dropbox. You will need up to __50-100Gb__ (Patch without these files coming soon).
- * Second, defines an experiment setup. The setups are:
-    * `deep100k_only_routing.ipynb` - DEEP100K dataset, 128dcs budget, 96d vectors, no compression
-    * `glove100k_compression.ipynb` - GLOVE100K dataset, 256dcs budget, 300d vectors, compressed to 75d
+ * First it downloads data from dropbox. You will need up to __50-70Gb__ (Precomputed optimal paths take most of the space. Patch with computing optimal routing on the fly coming soon).
+ * Second, defines an experiment setup. We provide one example per dataset:
+    * `SIFT100K_dcs256_gcn_size64_routing352_verification16.ipynb` - SIFT100K dataset, 256dcs budget, 128d vectors compressed to 64d, 352 routing dcs and 16 dcs for verification 
+    * `DEEP100K_dcs128_gcn_size96_routing120_verification8.ipynb` - DEEP100K dataset, 128dcs budget, 96d vectors, no compression, 120 routing dcs and 8 dcs for verification
+    * `GLOVE100K_dcs256_gcn_size75_routing596_verification32.ipynb` - GLOVE100K dataset, 256dcs budget, 300d vectors compressed to 75d, 596 routing dcs and 32 dcs for verification
     * An experiment setup
  * Another time-consuming stage is preparing path_cache. 
    * In[7] in both notebooks. 
@@ -34,4 +35,3 @@ It learns a mapping for vertices in an HNSW graph so as to improve nearest neigh
 # Ways to improve training performance
 * Grab a bigger GPU and/or more CPU cores
 * Multi-GPU training using torch DataParallel module
-* Compute optimal routing on the fly with some C/C++/Cython-based algorithm. And please contribute it to this repo :)
