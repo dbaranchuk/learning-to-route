@@ -1,4 +1,4 @@
-# Learning to route in similarity graphs
+# Learning to Route in Similarity Graphs
 Code for ICML2019 [paper](http://proceedings.mlr.press/v97/baranchuk19a.html)
 
 # What does it do?
