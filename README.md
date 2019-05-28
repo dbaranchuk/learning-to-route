@@ -1,5 +1,5 @@
 # Learning to route in similarity graphs
-Code for ICML2019 paper: [TODO: Link]()
+Code for ICML2019 [paper](http://proceedings.mlr.press/v97/baranchuk19a.html)
 
 # What does it do?
 It learns a mapping for vertices in an HNSW graph so as to improve nearest neighbor search and avoid local optima.
