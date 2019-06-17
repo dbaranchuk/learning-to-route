@@ -1,8 +1,7 @@
-import joblib
-import time
+import jobli
 import torch
 import numpy as np
-from heapq import heappush, heappop, nsmallest
+from heapq import heappush, heappop, nsmallest, nlargest
 from tensorboardX import SummaryWriter
 from datetime import datetime
 
@@ -12,17 +11,17 @@ from lib.nn_utils import get_device_of
 
 
 class SupervisedWalkerTrainer:
-    def __init__(self, agent, hnsw, path_cache, writer=None,
+    def __init__(self, agent, hnsw, oracle, writer=None,
                  Optimizer=lambda params: torch.optim.Adam(params, lr=1e-4, amsgrad=True),
                  device=None, **learning_rate_opts):
         """
         A class that handles agent training
         :type agent: lib.walker_agent.BaseWalkerAgent
         :type hnsw: lib.hnsw.WalkerHNSW
-        :type path_cache: lib.paths.PathCache
+        :type oracle: lib.ParallelBFS
         :param device: device to run computations on (string)
         """
-        self.agent, self.hnsw, self.path_cache = agent, hnsw, path_cache
+        self.agent, self.hnsw, self.oracle = agent, hnsw, oracle
         self.opt = Optimizer(agent.parameters())
         self.device = device or get_device_of(agent)
         self.learning_rate_opts = learning_rate_opts
@@ -65,12 +64,13 @@ class SupervisedWalkerTrainer:
         batch_queries = torch.tensor([rec['query'] for rec in batch_records], device=self.device)
         batch_query_vectors = self.agent.get_query_vectors(batch_queries, state=state,
                                                            device=self.device, **kwargs)
+
         # step 2: precompute all edge vectors, deduplicate for efficiency
         all_vertices = set()
         vertices_per_record = []
         for rec in batch_records:
             rec_edges = set()
-            for row in rec['logp_history']:
+            for row in rec['objectives']:
                 rec_edges.update(row['positive_ids'])
                 rec_edges.update(row['negative_ids'])
             all_vertices.update(rec_edges)
@@ -86,7 +86,7 @@ class SupervisedWalkerTrainer:
         query_ix, vertex_ix, is_numerator, row_ix, col_ix, row_weights = [], [], [], [], [], []
         row_index = 0
         for i, rec in enumerate(batch_records):
-            for row in rec['logp_history']:
+            for row in rec['objectives']:
                 num_vertices = (len(row['positive_ids']) + len(row['negative_ids']))
                 query_ix.extend([i] * num_vertices)
                 vertex_ix.extend([vertex_to_ix[vertex_id] for vertex_id in row['positive_ids'] + row['negative_ids']])
@@ -157,42 +157,65 @@ class SupervisedWalkerTrainer:
                 print('Done!', flush=True)
         # batch buffers
         batch_records, total_size = [], 0
+
         for chunk_queries, chunk_initial_vertices, chunk_gt in iterate_minibatches(
                 queries, initial_vertices, ground_truth,
                 batch_size=queries_per_chunk, cycle=cycle, shuffle=shuffle
         ):
             if verbose:
                 print(end="\nGenerating new batch of trajectories... ", flush=True)
-            records = generate_records(
-                self.hnsw, self.agent, self.path_cache,
-                chunk_queries, chunk_gt, initial_vertices=chunk_initial_vertices,
-                n_jobs=n_jobs, device=self.device, **kwargs
-            )
+
+            records = self.generate_records(queries=chunk_queries,
+                                            initial_vertices=chunk_initial_vertices.data.numpy(),
+                                            ground_truth=chunk_gt.data.numpy()[:, 0],
+                                            n_jobs=n_jobs, device=self.device, **kwargs)
             if verbose:
                 print("Done!", flush=True)
 
             for rec in records:
-                if len(batch_records) > 0 and total_size + len(rec['logp_history']) > batch_size_max:
+                if len(batch_records) > 0 and total_size + len(rec['objectives']) > batch_size_max:
                     yield batch_records
                     batch_records, total_size = [], 0
 
                 batch_records.append(rec)
-                total_size += len(rec['logp_history'])
+                total_size += len(rec['objectives'])
 
 
-def generate_records(hnsw, agent, path_cache, queries, ground_truth,
-                     initial_vertices=None, batch_size=None, n_jobs=-1, **kwargs):
-    """ Generate a batch of training records by pre-computing graph vertices and sampling trajectories """
-    query_vectors, vertex_id_to_vectors = prepare_vectors(agent, hnsw.graph, queries,
-                                                          batch_size=batch_size, **kwargs)
-    if initial_vertices is None:
-        initial_vertices = [hnsw.get_initial_vertex_id(q, **kwargs) for q in queries]
+    def generate_records(self, *, queries, initial_vertices, ground_truth,
+                         batch_size=None, n_jobs=-1, timeout=None, **kwargs):
+        """ Generate a batch of training records by pre-computing graph vertices and sampling trajectories """
+        assert np.ndim(initial_vertices) == 1 and np.ndim(ground_truth) == 1
+        agent, hnsw, oracle = self.agent, self.hnsw, self.oracle
+        query_vectors, vertex_id_to_vectors = prepare_vectors(agent, hnsw.graph, queries,
+                                                              batch_size=batch_size, **kwargs)
 
-    with global_variables(hnsw=hnsw, path_cache=path_cache, vertex_id_to_vectors=vertex_id_to_vectors):
-        make_sample_job = joblib.delayed(_sample_job)
-        jobs = (make_sample_job(*args, **kwargs)
-                for args in zip(queries.data.numpy(), query_vectors, initial_vertices, ground_truth.data.numpy()))
-        return joblib.Parallel(n_jobs=n_jobs)(jobs)
+        with global_variables(hnsw=hnsw, vertex_id_to_vectors=vertex_id_to_vectors, oracle=oracle):
+            # ^-- we implicitly pass read-only variables to _sample_job cuz it's faster this way
+            # 1. sample trajectories
+            make_sample_job = joblib.delayed(_sample_job)
+            samples_jobs = (make_sample_job(*args, **kwargs)
+                        for args in zip(query_vectors, initial_vertices, ground_truth))
+            trajectories = joblib.Parallel(n_jobs=n_jobs, timeout=timeout, backend='multiprocessing')(samples_jobs)
+
+            # 2. compute true number of hops from each visited vertex to ground truth
+            visited_ids = []
+            for record in trajectories:
+                all_vertices = list(record['visited_ids'] | {
+                    record['initial_vertex_id'], record['ground_truth_id']})
+                visited_ids.append(all_vertices)
+
+            oracle_distances = oracle(ground_truth, visited_ids, n_jobs=n_jobs)
+            # ^-- list of [{vertex id -> dist}]
+            # 3. compute objectives along sampled :trajectories: using :oracle_distances:
+            objectives = [_supervision_job(*args)
+                          for args in zip(queries.data.numpy(), trajectories, oracle_distances)]
+
+            # Note: using joblib twice sometimes leads to memory leak. So we comment it for stability.
+            # make_supervision_job = joblib.delayed(_supervision_job)
+            # supervision_jobs = (make_supervision_job(*args, **kwargs)
+            #         for args in zip(queries.data.numpy(), trajectories, oracle_distances))
+            # objectives = parallel_pool(supervision_jobs)
+            return objectives
 
 
 def prepare_vectors(agent, graph, queries, batch_size=None, **kwargs):
@@ -215,47 +238,45 @@ def prepare_vectors(agent, graph, queries, batch_size=None, **kwargs):
     return query_vectors, vertex_id_to_vectors
 
 
-def _sample_job(query, query_vec, initial_vertex, target_vertex, **kwargs):
+def _sample_job(query_vec, initial_vertex_id, ground_truth_id, **kwargs):
     """ A wrapper that samples one trajectory, used with joblib """
-    hnsw, path_cache, vertex_id_to_vectors = require_variables('hnsw', 'path_cache', 'vertex_id_to_vectors')
-    vertex_id_to_dist = path_cache[initial_vertex, target_vertex]
-    record = sample_training_record(
-        hnsw, path_cache, query_vec, vertex_id_to_vectors,
-        initial_vertex_id=int(initial_vertex),
-        vertex_id_to_dist=vertex_id_to_dist,
-        **kwargs)
-    return dict(record, query=query, gt=target_vertex)
+    hnsw, vertex_id_to_vectors, oracle = require_variables('hnsw', 'vertex_id_to_vectors', 'oracle')
+    initial_vertex_id, ground_truth_id = map(int, (initial_vertex_id, ground_truth_id))
+    return sample_agent_trajectory(
+        hnsw, query_vec, vertex_id_to_vectors,
+        initial_vertex_id=initial_vertex_id, ground_truth_id=ground_truth_id, **kwargs)
 
 
-def sample_training_record(hnsw, path_cache, query_vector, vertex_id_to_vectors,
-                           *, vertex_id_to_dist, initial_vertex_id,
-                           terminate_on_gt=False, verify_only_if_visited_gt=False,
-                           sampling_temperature=1.0, eps=1e-6, **kwargs):
+def _supervision_job(query, recorded_trajectory, vertex_id_to_dist, **kwargs):
+    """ A wrapper that computes all objectives along trajectory, used with joblib """
+    hnsw, vertex_id_to_vectors, oracle = require_variables('hnsw', 'vertex_id_to_vectors', 'oracle')
+    return compute_expert_supervision(hnsw, query, recorded_trajectory, vertex_id_to_dist, **kwargs)
+
+
+def sample_agent_trajectory(hnsw, query_vector, vertex_id_to_vectors, *,
+                            initial_vertex_id, ground_truth_id, terminate_on_gt=False,
+                            sampling_temperature=1.0, eps=1e-6, **kwargs):
     """ Samples EF-search trajectory using pre-computed vectors
     :type hnsw: lib.hnsw.WalkerHNSW
-    :type path_cache: lib.paths.PathCache
     :param query_vector: query representation from agent.get_query_vector
-    :param vertex_id_to_vectors: dict {vertex -> vector}
-    :param vertex_id_to_dist: dict {vertex id -> num hops to target vertex}
+    :param vertex_id_to_vectors: numpy array [vertices_size x vector_size]
     :param initial_vertex_id: vertex id to start from
+    :param ground_truth_id: target that serch *should* find
     :param terminate_on_gt: if True, ends search immediately after visiting target vertex
-    :param verify_only_if_visited_gt: if True, adds verification loss only if target vertex is visited
     :param sampling_temperature: coefficient for gumbel noise added to distances.
         temperature=0 -> move exactly as during test, temperature > 0 -> more random moves
         higher temperature encourages exploration
     """
     assert isinstance(initial_vertex_id, (type(None), int))
-    assert initial_vertex_id in vertex_id_to_dist
 
     initial_distance = hnsw.distance_for_routing(query_vector, vertex_id_to_vectors[initial_vertex_id])
     if sampling_temperature != 0:
         noise = -np.log(-np.log(np.random.uniform(0.0, 1.0) + eps) + eps)
         initial_distance -= noise * sampling_temperature
 
-    # Below: a list of training examples:
-    # {'mode': LOGP_MODES, 'positive_ids': [...], 'negative_edges': [...]}
-    # such that at least one of positive_ids must be closer than all negative_ids
+    # training history: a list of training examples, examples are converted to loss after they are collected
     training_history = []
+    found_gt = initial_vertex_id == ground_truth_id
 
     candidates = []  # heap of vertices from smallest predicted distance to largest
     heappush(candidates, (initial_distance, initial_vertex_id))
@@ -264,27 +285,30 @@ def sample_training_record(hnsw, path_cache, query_vector, vertex_id_to_vectors,
 
     visited_ids = {initial_vertex_id}  # a set of vertices already visited by graph walker
 
-    # best visited vertex_id by num hops to gt
-    best_visited_actual_distance = vertex_id_to_dist[initial_vertex_id]
-    best_visited_vertex_id = initial_vertex_id
-
     neg_lower_bound_distance, lower_bound_vertex_id = nsmallest(1, ef_top)[0]
     lower_bound_distance = -neg_lower_bound_distance
     dcs, num_hops = 1, 1
 
     while len(candidates) != 0:
+        # record which candidates were available for selection (for loss)
+        if not found_gt:
+            training_history.append(dict(name='select_next', found_gt=found_gt,
+                                         candidate_vertices=[v for _, v in candidates]))
 
         # 1. pop vertex according to graph walker
         estimated_distance, vertex_id = heappop(candidates)
 
-        # if budget setup walk until the end
-        if np.isfinite(hnsw.ef) and estimated_distance > lower_bound_distance: break
+        if np.isfinite(hnsw.ef):
+            training_history.append(dict(
+                name='early_termination', found_gt=found_gt,
+                chosen_vertex=vertex_id, lower_bound=lower_bound_vertex_id,
+            ))
+            if estimated_distance > lower_bound_distance: break
 
         # 2. gather all next vertices
         neighbor_ids = [neighbor_id for neighbor_id in hnsw.graph.edges[vertex_id]
-                        if neighbor_id not in visited_ids and neighbor_id in vertex_id_to_dist]
+                        if neighbor_id not in visited_ids]
 
-        # update visited ids
         visited_ids.update(neighbor_ids)
 
         # 3. compute distances and add all neighbors to candidates
@@ -294,13 +318,15 @@ def sample_training_record(hnsw, path_cache, query_vector, vertex_id_to_vectors,
         else:
             distances = []
 
-        optimal_neighbors_with_lower_bounds = []  # [(neighbor_id, lower_bound_id)]
-        best_visited_actual_distance_before_expand = best_visited_actual_distance
+        # add penalty for pruning neighbors from heap by lower bound
+        # this penalty will only be applied to edges that are closer to gt than best vertex in heap
+        penalty_for_pruning = dict(name='do_not_prune_optimal', neighbors=[], lower_bounds=[])
+        had_gt_before = found_gt
 
         for distance, neighbor_id in zip(map(float, distances), neighbor_ids):
-            if vertex_id_to_dist[neighbor_id] < best_visited_actual_distance_before_expand:
-                if len(ef_top) > hnsw.ef:
-                    optimal_neighbors_with_lower_bounds.append((neighbor_id, lower_bound_vertex_id))
+            if len(ef_top) > hnsw.ef:
+                penalty_for_pruning['neighbors'].append(neighbor_id)
+                penalty_for_pruning['lower_bounds'].append(lower_bound_vertex_id)
 
             if sampling_temperature != 0:
                 noise = -np.log(-np.log(np.random.uniform(0.0, 1.0) + eps) + eps)
@@ -314,100 +340,121 @@ def sample_training_record(hnsw, path_cache, query_vector, vertex_id_to_vectors,
                     _, pruned_vertex_id = heappop(ef_top)
 
                     # loss: make sure we didn't prune gt vertex
-                    if vertex_id_to_dist[pruned_vertex_id] == 0:
+                    if pruned_vertex_id == ground_truth_id:
                         training_history.append(dict(
-                            name='keep_gt_in_heap', level=0,
+                            name='keep_gt_in_heap',
                             positive_ids=[pruned_vertex_id],
                             negative_ids=[nsmallest(1, ef_top)[0][1]],
                         ))
 
                 neg_lower_bound_distance, lower_bound_vertex_id = nsmallest(1, ef_top)[0]
                 lower_bound_distance = -neg_lower_bound_distance
+
+                # if we found gt, we may want to terminate
+                found_gt = found_gt or (neighbor_id == ground_truth_id)
+                if found_gt and terminate_on_gt: break
+
             else:
                 pass  # pruned by lower bound
-
-            # maintain the nearest visited vertex
-            if vertex_id_to_dist[neighbor_id] < best_visited_actual_distance:
-                best_visited_actual_distance = vertex_id_to_dist[neighbor_id]
-                best_visited_vertex_id = neighbor_id
 
             # early stopping by dcs
             dcs += 1
             if dcs >= hnsw.max_dcs: break
 
-        # 4. gather all optimal and all suboptimal choices for the next steps
-
-        # 4.1 If we haven't found gt (reference answer) yet,
-        # optimal action is to expand the vertex which is closest to answer (or any of several such vertices)
-        if best_visited_actual_distance != 0 and len(candidates) > 0:
-            positive_ids = {
-                vid for _, vid in candidates
-                if vertex_id_to_dist[vid] <= best_visited_actual_distance
-            }
-            negative_ids = {vid for _, vid in candidates
-                            if vertex_id_to_dist[vid] > best_visited_actual_distance}
-
-            # Also make sure at least one optimal vertex will not be pruned by lower bound during next [step 1.]
-            negative_ids.add(lower_bound_vertex_id)
-            if len(positive_ids) > 0 and len(negative_ids) > 0:
-                training_history.append(dict(
-                    name='select_next', level=vertex_id_to_dist[next(iter(positive_ids))],
-                    positive_ids=list(positive_ids),
-                    negative_ids=list(negative_ids),
-                ))
-            else:
-                pass  # at this point fringe does not contain any vertices better than what we've visited
-
-        # 4.2 Also if new visited_ids from contained something better than our current candidates,
-        # make sure we didn't just prune it. At least one optimal candidate must exceed its lower bound
-        # note: this is only possible if best_visited_actual_distance != 0
-        if len(optimal_neighbors_with_lower_bounds):
-            positive_ids, negative_ids = zip(*optimal_neighbors_with_lower_bounds)
-            training_history.append(dict(
-                name='do_not_prune_optimal', level=vertex_id_to_dist[positive_ids[0]],
-                positive_ids=list(set(positive_ids)),
-                negative_ids=list(set(negative_ids)),
-            ))
-            # Note: we use logp-any as a proxy of the actual loss, which should be pairwise sigmoid log-p
-
-        if terminate_on_gt and best_visited_actual_distance == 0:
-            # we have already found gt, nothing else required
-            # TODO: learn to terminate search ASAP?
-            break
+        if not had_gt_before and len(penalty_for_pruning['neighbors']) > 0:
+            training_history.append(penalty_for_pruning)
 
         num_hops += 1
         if num_hops >= hnsw.max_hops: break
         if dcs >= hnsw.max_dcs: break
+        if found_gt and terminate_on_gt: break
 
-    # make sure hnsw finds best vertex
-    if not verify_only_if_visited_gt or best_visited_actual_distance == 0:
-        # found gt IF best vertex is in ef_top and is one of the vertices used for selection
-        positive_ids = {vid for _, vid in ef_top
-                        if vertex_id_to_dist[vid] == best_visited_actual_distance}
+    # make sure gt is in top-k of the resulting structure
+    verification_top = nlargest(hnsw.top_vertices_for_verification, ef_top)
+    vertices_for_verification = [chosen_vertex_id for _neg_distance, chosen_vertex_id in verification_top]
+    vertices_for_verification = set(vertices_for_verification)
+    non_top_vertices = set(v for _, v in ef_top if v not in vertices_for_verification)
 
-        num_bottom_vertices = len(ef_top) - hnsw.top_vertices_for_verification
-        below_top = nsmallest(num_bottom_vertices, ef_top)
-        negative_ids = {vid for _, vid in below_top if vid not in positive_ids}
-
-        training_history.append(dict(
-            name='select_gt', level=best_visited_actual_distance,
-            positive_ids=list(positive_ids),
-            negative_ids=list(negative_ids),
-        ))
-
-    return compute_record_weights(dict(dcs=dcs, num_hops=num_hops, logp_history=training_history,
-                                       best_visited_distance=best_visited_actual_distance,
-                                       best_visited_vertex_id=best_visited_vertex_id))
+    training_history.append(dict(
+        name='select_gt', k=hnsw.top_vertices_for_verification, ef_top_heap=ef_top, gt=ground_truth_id,
+        top_vertices=list(vertices_for_verification), non_top_vertices=list(non_top_vertices)
+    ))
+    return dict(dcs=dcs, num_hops=num_hops, training_history=training_history, found_gt=found_gt,
+                initial_vertex_id=initial_vertex_id, ground_truth_id=ground_truth_id,
+                visited_ids=visited_ids)
 
 
-def compute_record_weights(record, verification_ratio=0.5):
+def compute_expert_supervision(hnsw, query, record, vertex_id_to_dist,
+                               verification_ratio=0.5, select_best_visited=True, **kwargs):
     """
-    Computes weights s.t. all verification weights add up to verification_ratio
-    and all non-verification loss adds up to (1.0 - verification_ratio)
+    takes training record as generated by sample_training_record,
+    computes a list of training objectives, each defined as a sum of components:
+        weight \cdot (\log{ sum_{v_i \in positive_ids} exp(-d(q, v_i)) } -
+          - \log{ sum_{v_j \in concat(positive_ids, negative_ids) } exp(-d(q, v_k)) })
+    Such objective essentially computes logp(any positive > all negatives) under gumbel noise
+
+    :param vertex_id_to_dist: a dict {vertex id -> distance to gt} for all vertex ids in record['visited_ids']
+        also necessarily including v0 and gt
+    :param verify_only_if_visited_gt: if True, adds verification loss only if target vertex is visited
+    :param verification_ratio: the total weight of all verification objectives equals this
+        (whereas the total weight of all other objectives equals 1 - verification_ratio)
+    :returns: dict(query, objectives) where objectives is a list of dictionaries,
+        each element is a dictionary containing {
+        'name': tag for ease of debugging
+        'positive_ids': a list of vertex ids to be included in numerator AND denominator
+        'negative ids': a list of vertex ids to be included in denominator only
+        'weight': multiplicative coefficient
+    }
     """
-    verification_rows = [row for row in record['logp_history'] if row['name'] == 'select_gt']
-    routing_weight = 1. / max(1, len(record['logp_history']) - len(verification_rows)) * (1 - verification_ratio)
+
+    # compute all objectives
+    objectives = []
+    for event in record['training_history']:
+        if event['name'] == 'select_next':
+            # At each step learn to select an optimal vertex from heap
+            # an optimal vertex is one of the vertices that have minimal distance to gt in terms of hops
+            if event['found_gt']: continue
+            candidate_vertices = event['candidate_vertices']
+            candidate_distances = [vertex_id_to_dist[v] for v in candidate_vertices]
+            optimal_distance = min(candidate_distances)
+            objectives.append(dict(
+                name=event['name'],
+                positive_ids=[v for v, d in zip(candidate_vertices, candidate_distances)
+                              if d <= optimal_distance],
+                negative_ids=[v for v, d in zip(candidate_vertices, candidate_distances)
+                              if d > optimal_distance],
+            ))
+        elif event['name'] == 'select_gt':
+            # make sure ground_truth_id is one of the vertices returned for verification
+            # if it isn't found, make
+            candidate_vertices = event['top_vertices'] + event['non_top_vertices']
+            candidate_distances = [vertex_id_to_dist[v] for v in candidate_vertices]
+            if select_best_visited:
+                best_visited_disance = min(candidate_distances)
+                positive_ids = {v for v, d in zip(candidate_vertices, candidate_distances)
+                                if d <= best_visited_disance}
+            else:
+                positive_ids = {event['gt']}
+
+            negative_ids = {v for v in event['non_top_vertices'] if v not in positive_ids}
+
+            objectives.append(dict(
+                name=event['name'],
+                positive_ids=list(positive_ids),
+                negative_ids=list(negative_ids),
+            ))
+        else:
+            raise NotImplementedError("Objective '{}' isn't implemented, make sure ef == inf"
+                                      .format(event['name']))
+
+    assert len(objectives) == len(record['training_history'])
+
+    # compute weights s.t. all verification weights add up to verification_ratio
+    # and all non-verification loss adds up to (1.0 - verification_ratio)
+
+    verification_rows = [row for row in objectives if row['name'] == 'select_gt']
+    routing_weight = 1. / max(1, len(objectives) - len(verification_rows)) * (1 - verification_ratio)
     verification_weight = 1. / max(1, len(verification_rows)) * verification_ratio
-    for row in record['logp_history']:
+    for row in objectives:
         row['weight'] = verification_weight if ('gt' in row['name']) else routing_weight
-    return record
+    return dict(query=query, objectives=objectives)
