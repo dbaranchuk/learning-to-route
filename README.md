@@ -1,5 +1,5 @@
 # Learning to route in similarity graphs
-Code for ICML2019 paper: [TODO: Link]()
+Code for ICML2019 [paper](http://proceedings.mlr.press/v97/baranchuk19a.html)
 
 # What does it do?
 It learns a mapping for vertices in an HNSW graph so as to improve nearest neighbor search and avoid local optima.
@@ -17,12 +17,11 @@ It learns a mapping for vertices in an HNSW graph so as to improve nearest neigh
 1. Clone or download this repo. `cd` yourself to it's root directory.
 2. Grab or build a working python enviromnent. [Anaconda](https://www.anaconda.com/) works fine.
 3. Install packages from `requirements.txt`
- * Notably, the code __really__ requires joblib 0.9.4 and pytorch 1.0.0.
+ * Notably, the code __really__ requires joblib 0.13.2 and pytorch 1.0.0+.
  * You will also need jupyter or some other way to work with .ipynb files
 4. Run jupyter notebook and open a notebook in `./notebooks/`
  * Before you run the first cell, change `%env CUDA_VISIBLE_DEVICES=#` to an index that you plan to use.
- * First it downloads data from dropbox. You will need up to __50-70Gb__ (Precomputed optimal paths take most of the space. Patch with computing optimal routing on the fly coming soon).
- * Second, defines an experiment setup. We provide one example per dataset:
+ * Defines an experiment setup. We provide one example per dataset:
     * `SIFT100K_dcs256_gcn_size64_routing352_verification16.ipynb` - SIFT100K dataset, 256dcs budget, 128d vectors compressed to 64d, 352 routing dcs and 16 dcs for verification 
     * `DEEP100K_dcs128_gcn_size96_routing120_verification8.ipynb` - DEEP100K dataset, 128dcs budget, 96d vectors, no compression, 120 routing dcs and 8 dcs for verification
     * `GLOVE100K_dcs256_gcn_size75_routing596_verification32.ipynb` - GLOVE100K dataset, 256dcs budget, 300d vectors compressed to 75d, 596 routing dcs and 32 dcs for verification
