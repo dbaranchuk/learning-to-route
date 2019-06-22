@@ -1,7 +1,7 @@
 # Learning to Route in Similarity Graphs
 Code for ICML2019 [paper](http://proceedings.mlr.press/v97/baranchuk19a.html)
 
-### Update (See branch [online](https://github.com/dbaranchuk/learning-to-route/tree/online))
+#### Update (See branch [online](https://github.com/dbaranchuk/learning-to-route/tree/online))
 We introduce optimized version of this code with online optimal path computing using wrapped C++ implementation of BFS. Thus, it does not requiere preserving up to 70GB of precomputed paths on disk at the cost of training time increase. Moreover, this update allows to scale our method to million size datasets.
 
 # What does it do?
