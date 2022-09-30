@@ -1,6 +1,6 @@
 numpy==1.16.0
 torch==1.0.0
-joblib==0.13.2
+joblib==1.2.0
 pandas
 matplotlib
 tqdm
